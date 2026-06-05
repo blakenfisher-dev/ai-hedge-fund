@@ -1,0 +1,90 @@
+name: RL EURUSD Paper Bot
+
+on:
+  schedule:
+    - cron: "15 7 * * 1-5"
+      timezone: Australia/Brisbane
+  workflow_dispatch:
+    inputs:
+      timesteps:
+        description: PPO training timesteps
+        required: true
+        default: "100000"
+      period:
+        description: Yahoo Finance history period
+        required: true
+        default: 2y
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rl-eurusd-paper-bot
+  cancel-in-progress: false
+
+jobs:
+  run-paper-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      OUTPUT_DIR: outputs/rl-paper-bot
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: rl_trading_bot/requirements.txt
+
+      - name: Install bot dependencies
+        run: python -m pip install --disable-pip-version-check -r rl_trading_bot/requirements.txt pytest
+
+      - name: Run bot tests
+        run: python -m pytest tests/test_rl_trading_bot.py -q
+
+      - name: Train, evaluate, and generate paper signal
+        env:
+          TIMESTEPS: ${{ github.event.inputs.timesteps || '100000' }}
+          PERIOD: ${{ github.event.inputs.period || '2y' }}
+        run: |
+          python -m rl_trading_bot run \
+            --symbol EURUSD=X \
+            --period "$PERIOD" \
+            --interval 1h \
+            --timesteps "$TIMESTEPS" \
+            --output-dir "$OUTPUT_DIR"
+
+      - name: Write job summary
+        if: always()
+        run: |
+          if [ -f "$OUTPUT_DIR/latest_signal.json" ]; then
+            python - <<'PY'
+          import json
+          import os
+
+          path = os.path.join(os.environ["OUTPUT_DIR"], "latest_signal.json")
+          signal = json.load(open(path, encoding="utf-8"))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("## EUR/USD paper signal\n\n")
+              summary.write(f"- Bar: `{signal['generated_from_bar']}`\n")
+              summary.write(f"- Action: **{signal['effective_action']}**\n")
+              summary.write(f"- Position: `{signal['current_position']}`\n")
+              summary.write(f"- Simulated equity: `${signal['equity_usd']:.2f}`\n")
+              summary.write("\nNo broker order was submitted.\n")
+          PY
+          else
+            echo "Bot failed before producing a signal." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload model and audit artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rl-eurusd-paper-bot-${{ github.run_number }}
+          path: outputs/rl-paper-bot
+          if-no-files-found: warn
+          retention-days: 30
